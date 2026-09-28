@@ -1,7 +1,9 @@
 const express = require('express');
 const { Pool } = require('pg');
+const Redis = require('ioredis');
 
 const app = express();
+const redis = new Redis(); // connects to localhost:6379 by default
 
 const pool = new Pool({
   host: 'localhost',
@@ -10,6 +12,7 @@ const pool = new Pool({
   database: 'flashslot',
 });
 
+const HOLD_SECONDS = 120;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 app.get('/seats', async (req, res) => {
@@ -17,15 +20,15 @@ app.get('/seats', async (req, res) => {
   res.json(result.rows);
 });
 
-// HATALI versiyon: kilit yok
+// UNSAFE version: no locking, kept on purpose to demonstrate the race condition
 app.post('/reserve-unsafe/:label/:user', async (req, res) => {
   const { label, user } = req.params;
 
   const result = await pool.query('SELECT * FROM seats WHERE label = $1', [label]);
   const seat = result.rows[0];
 
-  if (!seat) return res.status(404).json({ error: 'Koltuk yok' });
-  if (seat.status !== 'available') return res.status(409).json({ error: 'Koltuk dolu' });
+  if (!seat) return res.status(404).json({ error: 'Seat not found' });
+  if (seat.status !== 'available') return res.status(409).json({ error: 'Seat already taken' });
 
   await sleep(100);
 
@@ -33,14 +36,30 @@ app.post('/reserve-unsafe/:label/:user', async (req, res) => {
     'UPDATE seats SET status = $1, reserved_by = $2 WHERE label = $3',
     ['reserved', user, label]
   );
-  res.json({ message: `${user} ${label} koltuğunu aldı` });
+  res.json({ message: `${user} reserved ${label}` });
 });
 
-// DÜZELTİLMİŞ versiyon: FOR UPDATE kilidi
+// STEP 1: temporary hold in Redis (fast, no database involved)
+app.post('/hold/:label/:user', async (req, res) => {
+  const { label, user } = req.params;
+
+  const ok = await redis.set(`hold:${label}`, user, 'EX', HOLD_SECONDS, 'NX');
+  if (ok !== 'OK') {
+    return res.status(409).json({ error: 'Seat is held by someone else' });
+  }
+  res.json({ message: `${user} is holding ${label} for ${HOLD_SECONDS} seconds` });
+});
+
+// STEP 2: permanent reservation in PostgreSQL, only for the person holding the seat
 app.post('/reserve/:label/:user', async (req, res) => {
   const { label, user } = req.params;
-  const client = await pool.connect();
 
+  const holder = await redis.get(`hold:${label}`);
+  if (holder !== user) {
+    return res.status(403).json({ error: 'You do not hold this seat (or your hold expired)' });
+  }
+
+  const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
@@ -52,14 +71,12 @@ app.post('/reserve/:label/:user', async (req, res) => {
 
     if (!seat) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Koltuk yok' });
+      return res.status(404).json({ error: 'Seat not found' });
     }
     if (seat.status !== 'available') {
       await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'Koltuk dolu' });
+      return res.status(409).json({ error: 'Seat already taken' });
     }
-
-    await sleep(100);
 
     await client.query(
       'UPDATE seats SET status = $1, reserved_by = $2 WHERE label = $3',
@@ -67,13 +84,14 @@ app.post('/reserve/:label/:user', async (req, res) => {
     );
 
     await client.query('COMMIT');
-    res.json({ message: `${user} ${label} koltuğunu aldı` });
+    await redis.del(`hold:${label}`);
+    res.json({ message: `${user} reserved ${label}` });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: 'Sunucu hatası' });
+    res.status(500).json({ error: 'Server error' });
   } finally {
     client.release();
   }
 });
 
-app.listen(3000, () => console.log('Sunucu 3000 portunda çalışıyor'));
+app.listen(3000, () => console.log('Server running on port 3000'));
