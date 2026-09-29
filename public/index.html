@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FlashSlot</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee;
+         display: flex; flex-direction: column; align-items: center; }
+  #who { color: #888; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(5, 120px); gap: 12px; }
+  .seat { border: none; border-radius: 10px; padding: 18px 0; font-size: 16px;
+          font-weight: 600; color: #111; cursor: pointer; text-align: center; }
+  .available { background: #2ecc71; }
+  .held { background: #f1c40f; }
+  .reserved { background: #e74c3c; color: #fff; cursor: not-allowed; }
+  .sub { display: block; font-size: 12px; font-weight: 400; margin-top: 6px; }
+  #log { margin-top: 24px; max-width: 90vw; font-size: 14px; color: #aaa; min-height: 20px; }
+</style>
+</head>
+<body>
+<h1>FlashSlot</h1>
+<div id="who"></div>
+<div class="grid" id="grid"></div>
+<div id="log"></div>
+<script>
+const user = prompt('Your name?') || 'anonymous';
+document.getElementById('who').textContent =
+  'You are: ' + user + ' — click a green seat to hold it, click your yellow seat to reserve it.';
+
+const grid = document.getElementById('grid');
+const logEl = document.getElementById('log');
+
+async function refresh() {
+  const seats = await (await fetch('/seats')).json();
+  grid.innerHTML = '';
+  for (const s of seats) {
+    const b = document.createElement('button');
+    b.className = 'seat ' + s.status;
+    let sub = '';
+    if (s.status === 'held') sub = s.held_by + ' · ' + s.ttl + 's';
+    if (s.status === 'reserved') sub = s.reserved_by;
+    b.innerHTML = s.label + '<span class="sub">' + sub + '</span>';
+    b.onclick = () => act(s);
+    grid.appendChild(b);
+  }
+}
+
+async function act(seat) {
+  let url;
+  if (seat.status === 'available') url = `/hold/${seat.label}/${user}`;
+  else if (seat.status === 'held' && seat.held_by === user) url = `/reserve/${seat.label}/${user}`;
+  else return;
+  const res = await fetch(url, { method: 'POST' });
+  const body = await res.json();
+  logEl.textContent = res.status + ' — ' + (body.message || body.error);
+  refresh();
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

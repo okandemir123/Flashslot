@@ -10,10 +10,18 @@ This repo contains the broken version on purpose (`/reserve-unsafe`) so the bug 
 
 ## How it works
 
-The fix uses two layers:
+Two layers, each one atomic:
 
-1. **Redis (fast gatekeeper):** when a user picks a seat, the server runs `SET hold:<seat> <user> NX EX 120`. `NX` means "only set if it does not exist", so only one user can hold a seat. Everyone else is rejected immediately, without touching the database. `EX 120` makes the hold expire after 120 seconds, so an abandoned checkout frees the seat automatically.
-2. **PostgreSQL (final decision):** the user who holds the seat confirms the booking. The server opens a transaction and runs `SELECT ... FOR UPDATE`, which locks the seat row until the transaction ends. Even if something goes wrong in the first layer, the database can never book the same seat twice.
+1. **Redis (fast gatekeeper):** `SET hold:<seat> <user> NX EX 120`. `NX` = "only set if it does not exist", so exactly one user can hold a seat; everyone else is rejected instantly, without touching the database. `EX 120` expires abandoned holds automatically.
+2. **PostgreSQL (final decision):** the holder confirms with `SELECT ... FOR UPDATE` inside a transaction, which locks the seat row until COMMIT. Even if the first layer misbehaves, the database can never book the same seat twice.
+
+```
+            hold (Redis, atomic)              reserve (PostgreSQL, row lock)
+
+client A ──► SET hold:A1 NX EX 120 ──► OK ──► BEGIN;
+client B ──► SET hold:A1 NX EX 120 ──► nil      SELECT ... FOR UPDATE   ← row locked
+             (409, rejected instantly)        status = 'available'? → UPDATE → COMMIT
+```
 
 ## Tech stack
 
@@ -25,14 +33,18 @@ The fix uses two layers:
 
 | Method | Endpoint | Description |
 | ------ | -------- | ----------- |
-| GET | `/seats` | List all seats |
-| POST | `/hold/:seat/:user` | Hold a seat for 120 seconds |
-| POST | `/reserve/:seat/:user` | Confirm the booking (only for the user holding the seat) |
-| POST | `/reserve-unsafe/:seat/:user` | Naive version without locking, for demonstrating the bug |
+| GET | `/seats` | List all seats (`available` / `held` with TTL / `reserved`) |
+| POST | `/hold/:label/:user` | Hold a seat for 120 seconds |
+| POST | `/reserve/:label/:user` | Confirm the booking (only for the user holding the seat) |
+| POST | `/reserve-unsafe/:label/:user` | Naive version without locking, to demonstrate the bug |
+
+## Web UI
+
+Open `http://localhost:3000` — a small polling page shows seats in green (available), yellow (held, with TTL countdown) and red (reserved). Click a green seat to hold it, click your yellow seat to reserve it. Open two browsers and fight over a seat.
 
 ## Run it locally
 
-Requirements: Node.js, PostgreSQL and Redis running on default ports.
+Requirements: Node.js 20+, PostgreSQL, Redis.
 
 ```bash
 npm install
@@ -42,7 +54,8 @@ sudo su postgres -c "psql -c 'CREATE DATABASE flashslot;'"
 sudo su postgres -c "psql -c \"CREATE USER flash WITH PASSWORD 'flash123' SUPERUSER;\""
 sudo su postgres -c "psql -d flashslot" < schema.sql
 
-node server.js
+cp .env.example .env   # then edit the values
+npm start
 ```
 
 ## Try it: 20 users, one seat
@@ -55,7 +68,30 @@ done | sort | uniq -c
 
 Expected result: exactly one `200` and nineteen `409`.
 
+Benchmark version (autocannon):
+
+```bash
+npx autocannon -c 20 -a 20 -m POST localhost:3000/hold/A1/bench
+```
+
+Expected: 1×2xx and 19×409 in the status code stats.
+
+## Failure scenario: hold succeeds, reservation fails
+
+The two layers can disagree, and the system stays correct:
+
+- **Hold expired before checkout:** `/reserve` returns `403` — the seat is free for someone else to hold.
+- **Seat got reserved between hold and confirm:** the `FOR UPDATE` lock serializes the two transactions; the loser sees `status = 'reserved'`, gets `409`, and its stale hold is deleted. The seat is never double-booked.
+
+## Lessons learned
+
+- "Check, then act" is never atomic — without a lock, concurrent requests both pass the check.
+- `SET ... NX EX` gives you an atomic, self-expiring gate in a single round trip.
+- The database must be the final source of truth; Redis is an optimization, not a guarantee.
+- Defense in depth: either layer alone can race or fail — together they stay correct.
+- Keeping the broken endpoint (`/reserve-unsafe`) makes the fix *demonstrable*, not just claimed.
+
 ## Known limitations
 
-- `/hold` does not check if the seat is already permanently reserved. Double booking is still impossible because `/reserve` is protected by the database lock, but the user gets a late error.
-- Credentials are hardcoded for learning purposes. In production, use environment variables and a database user with limited permissions.
+- Identity is just a URL parameter — anyone can claim any username. Real systems need authentication.
+- The setup script creates a superuser for convenience; production should use a least-privilege role.
