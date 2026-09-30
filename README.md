@@ -1,7 +1,6 @@
 # FlashSlot
 
 A ticket reservation backend that never sells the same seat twice, even when hundreds of people click at the same moment.
-  
 
 ## The problem
 
@@ -35,8 +34,10 @@ client B ──► SET hold:A1 NX EX 120 ──► nil      SELECT ... FOR UPDAT
 | Method | Endpoint | Description |
 | ------ | -------- | ----------- |
 | GET | `/seats` | List all seats (`available` / `held` with TTL / `reserved`) |
+| GET | `/health` | Service health check (PostgreSQL and Redis reported separately) |
 | POST | `/hold/:label/:user` | Hold a seat for 120 seconds |
 | POST | `/reserve/:label/:user` | Confirm the booking (only for the user holding the seat) |
+| POST | `/release/:label/:user` | Give up a hold before it expires (only for the holder) |
 | POST | `/reserve-unsafe/:label/:user` | Naive version without locking, to demonstrate the bug |
 
 ## Web UI
@@ -87,6 +88,11 @@ The two layers can disagree, and the system stays correct:
 
 - **Hold expired before checkout:** `/reserve` returns `403` — the seat is free for someone else to hold.
 - **Seat got reserved between hold and confirm:** the `FOR UPDATE` lock serializes the two transactions; the loser sees `status = 'reserved'`, gets `409`, and its stale hold is deleted. The seat is never double-booked.
+
+## Operations
+
+- **Graceful shutdown:** on `SIGTERM`/`SIGINT` the server stops accepting new requests, lets running ones finish, and closes the Redis and PostgreSQL connections cleanly — no half-open connections on deploy.
+- **Health check:** `GET /health` reports PostgreSQL and Redis status separately (`{ "status": "ok", "db": true, "redis": true }`), so a degraded dependency is visible without killing the whole service.
 
 ## Lessons learned
 
