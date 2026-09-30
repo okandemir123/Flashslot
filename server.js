@@ -18,6 +18,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 app.use(express.static('public'));
 
+app.get('/health', async (req, res) => {
+  const result = { status: 'ok', db: true, redis: true };
+  try {
+    await pool.query('SELECT 1');
+  } catch (err) {
+    result.db = false;
+  }
+  try {
+    await redis.ping();
+  } catch (err) {
+    result.redis = false;
+  }
+  if (!result.db || !result.redis) result.status = 'degraded';
+  res.json(result);
+});
+
 app.get('/seats', async (req, res) => {
   const result = await pool.query('SELECT * FROM seats ORDER BY id');
   const seats = result.rows;
@@ -125,4 +141,35 @@ app.post('/reserve/:label/:user', async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log('Server running on port 3000'));
+// Optional: give up a hold before it expires
+app.post('/release/:label/:user', async (req, res) => {
+  const { label, user } = req.params;
+
+  const holder = await redis.get(`hold:${label}`);
+  if (!holder) {
+    return res.status(404).json({ error: 'No active hold on this seat' });
+  }
+  if (holder !== user) {
+    return res.status(403).json({ error: 'This seat is held by someone else' });
+  }
+
+  await redis.del(`hold:${label}`);
+  res.json({ message: `${user} released ${label}` });
+});
+
+const server = app.listen(3000, () => console.log('Server running on port 3000'));
+
+async function shutdown(signal) {
+  console.log(`${signal} received — shutting down gracefully...`);
+  server.close();      // stop accepting new requests, let running ones finish
+  try {
+    await redis.quit();  // close Redis connection cleanly
+    await pool.end();    // close all PostgreSQL clients
+  } catch (err) {
+    console.error('Error during shutdown:', err.message);
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
